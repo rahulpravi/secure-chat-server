@@ -227,6 +227,12 @@ io.on('connection', (socket) => {
   });
 
   // ── 5. DISCONNECT — Comprehensive Cleanup ──────────────────────────────────
+  // ഒരു യൂസർ ചാറ്റ് സ്കിപ്പ് ചെയ്തു പോകുമ്പോൾ മറ്റേ ആളെ അറിയിക്കാൻ
+  socket.on('leave-room', ({ roomId }) => {
+    socket.leave(roomId);
+    socket.to(roomId).emit('peer-disconnected');
+  });
+  
   //  Handles both voluntary leave and abrupt connection drops.
   socket.on('disconnect', (reason) => {
     console.log(`🔴 Disconnected: ${socket.id} (${reason})`);
