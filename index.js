@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * SECURE MESSENGER — ANONYMOUS TAG-BASED ROUTING SERVER
+ * ANON MESSENGER — ANONYMOUS TAG-BASED ROUTING SERVER
  * ============================================================
  * Architecture:
  *   - tagQueues     : Holds one waiting socket per tag
@@ -266,5 +266,5 @@ app.get('/health', (req, res) => {
 // ─── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🔒 Secure Messenger Tag-Router running on port ${PORT}`);
+  console.log(`🔒 Anon Messenger Tag-Router running on port ${PORT}`);
 });
