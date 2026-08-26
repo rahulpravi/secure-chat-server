@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "72e611eb-0a2d-4d47-b1ce-5b6de9d13755"
+      }
+    },
+    "android": {
+      "package": "com.dark0666.server"
+    }
+  }
+}
