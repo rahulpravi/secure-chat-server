@@ -53,6 +53,7 @@ const socketMeta  = {};  // socketId → { tag, roomId }
  * that are either waiting in or actively chatting under that tag.
  */
 function broadcastTagCount(tag) {
+  if (!tag) return;
   // Count: waiting user (if any) + active room users under this tag
   let count = tagQueues[tag] ? 1 : 0;
 
@@ -70,10 +71,12 @@ function broadcastTagCount(tag) {
  */
 function removeFromQueue(socketId) {
   const meta = socketMeta[socketId];
-  if (!meta || !meta.tag) return false;
+  if (!meta) return false;
 
-  const { tag } = meta;
-  if (tagQueues[tag] === socketId) {
+  const tag = meta.tag;
+  meta.tag = null; // Always clear tag reference from socket metadata
+
+  if (tag && tagQueues[tag] === socketId) {
     delete tagQueues[tag];
     broadcastTagCount(tag);
     return true;
@@ -82,7 +85,7 @@ function removeFromQueue(socketId) {
 }
 
 /**
- * Cleanly destroy an active room and notify the other user.
+ * Cleanly destroy an active room, notify the peer, and release all memory.
  * Returns the tag that was in use.
  */
 function destroyRoom(socketId) {
@@ -90,15 +93,23 @@ function destroyRoom(socketId) {
   if (!meta || !meta.roomId) return null;
 
   const { roomId } = meta;
+  meta.roomId = null; // Clear calling user's roomId immediately
+
   const room = activeRooms[roomId];
   if (!room) return null;
 
-  // Notify every OTHER user in the room
+  // Notify every OTHER user in the room and clear their roomId
   room.users.forEach((uid) => {
     if (uid !== socketId) {
       io.to(uid).emit('peer-disconnected');
-      // Clean up their meta so they don't try to clean room again
-      if (socketMeta[uid]) socketMeta[uid].roomId = null;
+      if (socketMeta[uid]) {
+        socketMeta[uid].roomId = null;
+      }
+    }
+    // Have socket leave the room if connected
+    const s = io.sockets.sockets.get(uid);
+    if (s) {
+      s.leave(roomId);
     }
   });
 
@@ -117,52 +128,79 @@ io.on('connection', (socket) => {
   socketMeta[socket.id] = { tag: null, roomId: null };
 
   // ── 1. JOIN TAG QUEUE ───────────────────────────────────────────────────────
-  //
-  //  Client emits: join-tag-queue  { tag: '#adventure' }
-  //  Server either:
-  //    a) Queues the user and emits 'waiting'
-  //    b) Matches with waiting user, emits 'matched' to both
-  //
-  socket.on('join-tag-queue', ({ tag }) => {
+  socket.on('join-tag-queue', (data) => {
+    const rawTag = data && typeof data === 'object' && typeof data.tag === 'string' ? data.tag : null;
+    if (!rawTag) {
+      socket.emit('error-msg', 'Please enter a valid tag.');
+      return;
+    }
+
     // Normalize: force lowercase, ensure '#' prefix
-    const normalizedTag = tag.trim().toLowerCase().startsWith('#')
-      ? tag.trim().toLowerCase()
-      : `#${tag.trim().toLowerCase()}`;
+    const trimmed = rawTag.trim().toLowerCase();
+    const normalizedTag = trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
 
     if (!normalizedTag || normalizedTag === '#') {
       socket.emit('error-msg', 'Please enter a valid tag.');
       return;
     }
 
+    // Clean up any existing state (active room or previous queue)
+    if (socketMeta[socket.id]?.roomId) {
+      destroyRoom(socket.id);
+    }
+    if (socketMeta[socket.id]?.tag) {
+      const oldTag = socketMeta[socket.id].tag;
+      removeFromQueue(socket.id);
+      socket.leave(`tag:${oldTag}`);
+    }
+
     // Subscribe this socket to the tag's broadcast channel
     socket.join(`tag:${normalizedTag}`);
     socketMeta[socket.id].tag = normalizedTag;
 
-    // ── Case A: No one waiting — add to queue ──────────────────────────────
-    if (!tagQueues[normalizedTag]) {
+    // ── Check waiting queue ──
+    let peerSocketId = tagQueues[normalizedTag];
+
+    // Edge case: self in queue
+    if (peerSocketId === socket.id) {
+      socket.emit('error-msg', 'Already in queue for this tag.');
+      return;
+    }
+
+    // If there is a peer in queue, verify they are still connected and valid
+    if (peerSocketId) {
+      const peerSocket = io.sockets.sockets.get(peerSocketId);
+      if (!peerSocket || !peerSocket.connected) {
+        // Peer is disconnected zombie — clean up stale queue entry
+        delete tagQueues[normalizedTag];
+        if (socketMeta[peerSocketId]) {
+          delete socketMeta[peerSocketId];
+        }
+        peerSocketId = null;
+      }
+    }
+
+    // ── Case A: No one waiting — add to queue ──
+    if (!peerSocketId) {
       tagQueues[normalizedTag] = socket.id;
       broadcastTagCount(normalizedTag);
 
+      // Compute actual current online count under this tag
+      let currentCount = 1;
+      for (const room of Object.values(activeRooms)) {
+        if (room.tag === normalizedTag) currentCount += room.users.size;
+      }
+
       socket.emit('waiting', {
         tag: normalizedTag,
-        onlineCount: 1,
+        onlineCount: currentCount,
       });
 
       console.log(`⏳ [${socket.id}] waiting in ${normalizedTag}`);
       return;
     }
 
-    // ── Case B: Someone IS waiting — match them ────────────────────────────
-    const peerSocketId = tagQueues[normalizedTag];
-
-    // Edge case: the waiting socket somehow matches itself (shouldn't happen,
-    // but guard anyway)
-    if (peerSocketId === socket.id) {
-      socket.emit('error-msg', 'Already in queue for this tag.');
-      return;
-    }
-
-    // Remove from queue before doing anything else
+    // ── Case B: Valid peer waiting — match them ──
     delete tagQueues[normalizedTag];
 
     // Generate a fresh, unguessable room ID and 256-bit AES key
@@ -177,13 +215,17 @@ io.on('connection', (socket) => {
     };
 
     // Update metadata for both sockets
-    socketMeta[peerSocketId].roomId = roomId;
-    socketMeta[socket.id].roomId    = roomId;
+    if (socketMeta[peerSocketId]) socketMeta[peerSocketId].roomId = roomId;
+    socketMeta[socket.id].roomId = roomId;
 
     // Join both sockets into the Socket.io room for message relay
     const peerSocket = io.sockets.sockets.get(peerSocketId);
-    if (peerSocket) peerSocket.join(roomId);
+    if (peerSocket) {
+      peerSocket.join(roomId);
+      peerSocket.leave(`tag:${normalizedTag}`);
+    }
     socket.join(roomId);
+    socket.leave(`tag:${normalizedTag}`);
 
     const matchPayload = { roomId, encKey, tag: normalizedTag };
     io.to(peerSocketId).emit('matched', matchPayload);
@@ -195,17 +237,26 @@ io.on('connection', (socket) => {
 
   // ── 2. LEAVE QUEUE (user cancels waiting) ──────────────────────────────────
   socket.on('leave-queue', () => {
+    const meta = socketMeta[socket.id];
+    const tag = meta?.tag;
     const wasRemoved = removeFromQueue(socket.id);
+    if (tag) {
+      socket.leave(`tag:${tag}`);
+    }
     if (wasRemoved) {
-      const tag = socketMeta[socket.id]?.tag;
-      if (tag) socket.leave(`tag:${tag}`);
       console.log(`🚪 [${socket.id}] left queue`);
     }
   });
 
   // ── 3. BLIND MESSAGE RELAY ─────────────────────────────────────────────────
-  //  The server NEVER decrypts. It blindly forwards the opaque ciphertext.
-  socket.on('send-message', ({ roomId, encryptedPayload }) => {
+  socket.on('send-message', (data) => {
+    if (!data || typeof data !== 'object') return;
+    const { roomId, encryptedPayload } = data;
+    if (!roomId || typeof roomId !== 'string' || !encryptedPayload || typeof encryptedPayload !== 'string') return;
+
+    // Limit payload size (max 64KB)
+    if (encryptedPayload.length > 65536) return;
+
     // Validate that this socket is actually in the claimed room
     const meta = socketMeta[socket.id];
     if (!meta || meta.roomId !== roomId) return;
@@ -214,26 +265,38 @@ io.on('connection', (socket) => {
   });
 
   // ── 4. TYPING INDICATORS ───────────────────────────────────────────────────
-  socket.on('typing-start', ({ roomId }) => {
+  socket.on('typing-start', (data) => {
+    if (!data || typeof data !== 'object') return;
+    const { roomId } = data;
+    if (!roomId || typeof roomId !== 'string') return;
+
     const meta = socketMeta[socket.id];
     if (!meta || meta.roomId !== roomId) return;
     socket.to(roomId).emit('stranger-typing');
   });
 
-  socket.on('typing-stop', ({ roomId }) => {
+  socket.on('typing-stop', (data) => {
+    if (!data || typeof data !== 'object') return;
+    const { roomId } = data;
+    if (!roomId || typeof roomId !== 'string') return;
+
     const meta = socketMeta[socket.id];
     if (!meta || meta.roomId !== roomId) return;
     socket.to(roomId).emit('stranger-stopped-typing');
   });
 
-  // ── 5. DISCONNECT — Comprehensive Cleanup ──────────────────────────────────
-  // ഒരു യൂസർ ചാറ്റ് സ്കിപ്പ് ചെയ്തു പോകുമ്പോൾ മറ്റേ ആളെ അറിയിക്കാൻ
-  socket.on('leave-room', ({ roomId }) => {
-    socket.leave(roomId);
-    socket.to(roomId).emit('peer-disconnected');
+  // ── 5. LEAVE ROOM / DISCONNECT — Comprehensive Cleanup ─────────────────────
+  socket.on('leave-room', (data) => {
+    const roomId = data && typeof data === 'object' ? data.roomId : null;
+    const meta = socketMeta[socket.id];
+    if (!meta) return;
+
+    if (meta.roomId && (!roomId || meta.roomId === roomId)) {
+      destroyRoom(socket.id);
+    }
   });
-  
-  //  Handles both voluntary leave and abrupt connection drops.
+
+  // Handles connection drops
   socket.on('disconnect', (reason) => {
     console.log(`🔴 Disconnected: ${socket.id} (${reason})`);
 
@@ -243,7 +306,8 @@ io.on('connection', (socket) => {
     if (meta.roomId) {
       // Was in an active chat — notify peer and destroy room
       destroyRoom(socket.id);
-    } else if (meta.tag) {
+    }
+    if (meta.tag) {
       // Was still waiting in queue
       removeFromQueue(socket.id);
     }
